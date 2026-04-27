@@ -52,18 +52,22 @@ def get_base_raw(file_bytes, auto_bright=False):
     try:
         # Usamos BytesIO para que rawpy pueda leer los bytes como un archivo
         with rawpy.imread(io.BytesIO(file_bytes)) as raw:
-            raw.unpack()
+            try:
+                raw.unpack()
+            except Exception as unpack_err:
+                return f"Error al desempaquetar datos: {str(unpack_err)}"
+                
             rgb = raw.postprocess(
                 use_camera_wb=True, 
                 no_auto_bright=not auto_bright, 
                 output_color=rawpy.ColorSpace.sRGB,
                 user_flip=0,
-                bright=1.0
+                bright=1.0,
+                no_auto_scale=False
             )
             return rgb
     except Exception as e:
-        # Retornamos el error para poder mostrarlo en la UI si es necesario
-        return e
+        return str(e)
 
 def apply_adjustments(rgb_array, params, lut_file=None):
     """Motor de ajustes avanzados."""
@@ -105,11 +109,9 @@ def apply_adjustments(rgb_array, params, lut_file=None):
 
 def create_social_frame(img, file_bytes, palette):
     """Añade la ficha técnica y paleta al JPG final de 1080px (borde corto)."""
-    # 1. Redimensionar imagen principal
     img_resized = resize_for_social(img)
     w, h = img_resized.size
     
-    # 2. Extraer EXIF
     try:
         tags = exifread.process_file(io.BytesIO(file_bytes), details=False)
         iso = tags.get('EXIF ISOSpeedRatings', 'N/A')
@@ -119,7 +121,6 @@ def create_social_frame(img, file_bytes, palette):
     except:
         exif_text = "Datos EXIF no disponibles"
 
-    # 3. Crear lienzo con franja inferior
     footer_h = int(h * 0.15)
     canvas = Image.new('RGB', (w, h + footer_h), (15, 15, 15))
     canvas.paste(img_resized, (0, 0))
@@ -142,10 +143,13 @@ def create_social_frame(img, file_bytes, palette):
 
 def get_palette(img):
     """Extrae 5 colores para el diseño."""
-    img_small = img.resize((50, 50))
-    ar = np.asarray(img_small).reshape(-1, 3)
-    kmeans = KMeans(n_clusters=5, n_init=5).fit(ar)
-    return [tuple(c) for c in kmeans.cluster_centers_.astype(int)]
+    try:
+        img_small = img.resize((50, 50))
+        ar = np.asarray(img_small).reshape(-1, 3)
+        kmeans = KMeans(n_clusters=5, n_init=5).fit(ar)
+        return [tuple(c) for c in kmeans.cluster_centers_.astype(int)]
+    except:
+        return [(50,50,50)] * 5
 
 # --- INTERFAZ DE USUARIO ---
 
@@ -183,33 +187,24 @@ if uploaded_files:
     cols = st.columns(2)
     
     for idx, file in enumerate(uploaded_files[:10]):
-        # IMPORTANTE: Usamos getvalue() para obtener los bytes sin perder el puntero en reruns
         file_data = file.getvalue()
-        
-        # Intentamos revelar el RAW
         result = get_base_raw(file_data, auto_bright=auto_mode)
         
         if isinstance(result, np.ndarray):
-            # Procesar imagen con sliders
             final_img = apply_adjustments(result, params, lut_upload)
             
-            # Crear previsualización liviana para la web
             preview_img = final_img.copy()
             preview_img.thumbnail((1000, 1000))
             palette = get_palette(preview_img)
             
             with cols[idx % 2]:
                 st.markdown(f'<div class="img-card">', unsafe_allow_html=True)
-                
-                # --- VISTA PREVIA ---
                 st.image(preview_img, caption=f"Editando: {file.name}", use_container_width=True)
                 
-                # --- PROCESAR DESCARGA (1080px short edge) ---
                 social_jpg = create_social_frame(final_img, file_data, palette)
                 buf = io.BytesIO()
                 social_jpg.save(buf, format="JPEG", quality=95, subsampling=0)
                 
-                # --- BOTÓN DE DESCARGA ---
                 st.download_button(
                     label=f"💾 DESCARGAR JPG (1080px)",
                     data=buf.getvalue(),
@@ -217,12 +212,13 @@ if uploaded_files:
                     mime="image/jpeg",
                     key=f"dl_{idx}"
                 )
-                
                 st.markdown('</div>', unsafe_allow_html=True)
         else:
-            # Si 'result' no es un array, es el error capturado
-            st.error(f"Error en {file.name}: {result}")
-            st.info("Asegúrate de que el archivo no esté corrupto y sea compatible con LibRaw.")
+            with cols[idx % 2]:
+                st.error(f"Error en {file.name}: {result}")
+                if file.name.lower().endswith('.nef'):
+                    st.warning("⚠️ **Nota para Nikon**: Si usas cámaras como la Z8 o Z9, asegúrate de **NO** usar compresión 'High Efficiency' (HE), ya que LibRaw no la soporta aún. Usa compresión 'Sin pérdidas'.")
+                st.info("Verifica que el archivo no esté corrupto.")
         
         gc.collect()
 else:
