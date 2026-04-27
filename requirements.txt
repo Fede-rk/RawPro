@@ -1,0 +1,8 @@
+streamlit
+rawpy
+pillow
+pillow-lut
+exifread
+scikit-learn
+numpy
+imageio
