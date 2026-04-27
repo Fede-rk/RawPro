@@ -50,17 +50,20 @@ def resize_for_social(img, short_edge=1080):
 def get_base_raw(file_bytes, auto_bright=False):
     """Revelado base del RAW. Cacheado para velocidad."""
     try:
+        # Usamos BytesIO para que rawpy pueda leer los bytes como un archivo
         with rawpy.imread(io.BytesIO(file_bytes)) as raw:
             raw.unpack()
             rgb = raw.postprocess(
                 use_camera_wb=True, 
                 no_auto_bright=not auto_bright, 
                 output_color=rawpy.ColorSpace.sRGB,
-                user_flip=0
+                user_flip=0,
+                bright=1.0
             )
             return rgb
-    except Exception:
-        return None
+    except Exception as e:
+        # Retornamos el error para poder mostrarlo en la UI si es necesario
+        return e
 
 def apply_adjustments(rgb_array, params, lut_file=None):
     """Motor de ajustes avanzados."""
@@ -109,7 +112,10 @@ def create_social_frame(img, file_bytes, palette):
     # 2. Extraer EXIF
     try:
         tags = exifread.process_file(io.BytesIO(file_bytes), details=False)
-        exif_text = f"ISO {tags.get('EXIF ISOSpeedRatings', 'N/A')} | f/{tags.get('EXIF FNumber', 'N/A')} | {tags.get('EXIF ExposureTime', 'N/A')}s"
+        iso = tags.get('EXIF ISOSpeedRatings', 'N/A')
+        f_stop = tags.get('EXIF FNumber', 'N/A')
+        shutter = tags.get('EXIF ExposureTime', 'N/A')
+        exif_text = f"ISO {iso} | f/{f_stop} | {shutter}s"
     except:
         exif_text = "Datos EXIF no disponibles"
 
@@ -170,20 +176,22 @@ params = {
     'temp': temp, 'shadows': sha, 'highlights': hig, 'clarity': cla
 }
 
-files = st.file_uploader("Sube tus archivos RAW", type=['nef', 'cr2', 'arw', 'dng', 'orf'], accept_multiple_files=True)
+uploaded_files = st.file_uploader("Sube tus archivos RAW", type=['nef', 'cr2', 'arw', 'dng', 'orf'], accept_multiple_files=True)
 
-if files:
+if uploaded_files:
     st.divider()
-    # Usar columnas para la cuadrícula
     cols = st.columns(2)
     
-    for idx, file in enumerate(files[:10]):
-        file_bytes = file.read()
-        base_rgb = get_base_raw(file_bytes, auto_bright=auto_mode)
+    for idx, file in enumerate(uploaded_files[:10]):
+        # IMPORTANTE: Usamos getvalue() para obtener los bytes sin perder el puntero en reruns
+        file_data = file.getvalue()
         
-        if base_rgb is not None:
+        # Intentamos revelar el RAW
+        result = get_base_raw(file_data, auto_bright=auto_mode)
+        
+        if isinstance(result, np.ndarray):
             # Procesar imagen con sliders
-            final_img = apply_adjustments(base_rgb, params, lut_upload)
+            final_img = apply_adjustments(result, params, lut_upload)
             
             # Crear previsualización liviana para la web
             preview_img = final_img.copy()
@@ -197,7 +205,7 @@ if files:
                 st.image(preview_img, caption=f"Editando: {file.name}", use_container_width=True)
                 
                 # --- PROCESAR DESCARGA (1080px short edge) ---
-                social_jpg = create_social_frame(final_img, file_bytes, palette)
+                social_jpg = create_social_frame(final_img, file_data, palette)
                 buf = io.BytesIO()
                 social_jpg.save(buf, format="JPEG", quality=95, subsampling=0)
                 
@@ -212,7 +220,9 @@ if files:
                 
                 st.markdown('</div>', unsafe_allow_html=True)
         else:
-            st.error(f"No se pudo revelar {file.name}")
+            # Si 'result' no es un array, es el error capturado
+            st.error(f"Error en {file.name}: {result}")
+            st.info("Asegúrate de que el archivo no esté corrupto y sea compatible con LibRaw.")
         
         gc.collect()
 else:
