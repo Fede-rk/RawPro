@@ -30,6 +30,9 @@ st.markdown("""
         background-color: #1a1c23;
         margin-bottom: 30px;
     }
+    .stAlert {
+        border-radius: 10px;
+    }
     </style>
     """, unsafe_allow_html=True)
 
@@ -48,14 +51,14 @@ def resize_for_social(img, short_edge=1080):
 
 @st.cache_data(show_spinner=False)
 def get_base_raw(file_bytes, auto_bright=False):
-    """Revelado base del RAW. Cacheado para velocidad."""
+    """Revelado base del RAW con manejo de errores mejorado para cámaras nuevas."""
     try:
-        # Usamos BytesIO para que rawpy pueda leer los bytes como un archivo
         with rawpy.imread(io.BytesIO(file_bytes)) as raw:
             try:
+                # Intentamos desempaquetar. Si falla aquí, es el formato de compresión.
                 raw.unpack()
             except Exception as unpack_err:
-                return f"Error al desempaquetar datos: {str(unpack_err)}"
+                return f"UNSUPPORTED_COMPRESSION: {str(unpack_err)}"
                 
             rgb = raw.postprocess(
                 use_camera_wb=True, 
@@ -71,17 +74,14 @@ def get_base_raw(file_bytes, auto_bright=False):
 
 def apply_adjustments(rgb_array, params, lut_file=None):
     """Motor de ajustes avanzados."""
-    # Procesamiento con Numpy para Sombras/Altas Luces
     img_data = rgb_array.astype(np.float32) / 255.0
     
-    # Balance de Blancos (Temperatura)
     if params['temp'] != 0:
         t = params['temp'] / 10.0
         img_data[:, :, 0] *= (1.0 + t)
         img_data[:, :, 2] *= (1.0 - t)
         img_data = np.clip(img_data, 0, 1)
 
-    # Sombras y Altas Luces
     if params['shadows'] != 0:
         gamma_s = 1.0 - (params['shadows'] / 4.0)
         img_data = np.where(img_data < 0.5, np.power(img_data * 2, gamma_s) / 2, img_data)
@@ -91,7 +91,6 @@ def apply_adjustments(rgb_array, params, lut_file=None):
 
     img = Image.fromarray((np.clip(img_data, 0, 1) * 255).astype(np.uint8))
     
-    # Ajustes PIL
     img = ImageEnhance.Brightness(img).enhance(1.0 + (params['exposure'] / 5.0))
     img = ImageEnhance.Contrast(img).enhance(params['contrast'])
     img = ImageEnhance.Color(img).enhance(params['saturation'])
@@ -108,7 +107,7 @@ def apply_adjustments(rgb_array, params, lut_file=None):
     return img
 
 def create_social_frame(img, file_bytes, palette):
-    """Añade la ficha técnica y paleta al JPG final de 1080px (borde corto)."""
+    """Añade la ficha técnica y paleta al JPG final."""
     img_resized = resize_for_social(img)
     w, h = img_resized.size
     
@@ -127,14 +126,12 @@ def create_social_frame(img, file_bytes, palette):
     
     draw = ImageDraw.Draw(canvas)
     
-    # Dibujar Paleta
     pw = w // 10
     start_x = (w - (pw * len(palette))) // 2
     for i, color in enumerate(palette):
         x0 = start_x + (i * pw)
         draw.rectangle([x0, h + 20, x0 + pw - 10, h + footer_h - 45], fill=color)
     
-    # Texto EXIF
     try:
         draw.text((w//2, h + footer_h - 25), exif_text, fill=(150, 150, 150), anchor="ms")
     except: pass
@@ -142,7 +139,6 @@ def create_social_frame(img, file_bytes, palette):
     return canvas
 
 def get_palette(img):
-    """Extrae 5 colores para el diseño."""
     try:
         img_small = img.resize((50, 50))
         ar = np.asarray(img_small).reshape(-1, 3)
@@ -192,7 +188,6 @@ if uploaded_files:
         
         if isinstance(result, np.ndarray):
             final_img = apply_adjustments(result, params, lut_upload)
-            
             preview_img = final_img.copy()
             preview_img.thumbnail((1000, 1000))
             palette = get_palette(preview_img)
@@ -215,10 +210,26 @@ if uploaded_files:
                 st.markdown('</div>', unsafe_allow_html=True)
         else:
             with cols[idx % 2]:
-                st.error(f"Error en {file.name}: {result}")
-                if file.name.lower().endswith('.nef'):
-                    st.warning("⚠️ **Nota para Nikon**: Si usas cámaras como la Z8 o Z9, asegúrate de **NO** usar compresión 'High Efficiency' (HE), ya que LibRaw no la soporta aún. Usa compresión 'Sin pérdidas'.")
-                st.info("Verifica que el archivo no esté corrupto.")
+                st.error(f"Error en {file.name}")
+                
+                if "UNSUPPORTED_COMPRESSION" in str(result) or "Data error" in str(result):
+                    st.warning(f"⚠️ **Problema de Compatibilidad con Nikon Z50II**")
+                    st.markdown(f"""
+                    El motor de revelado no puede leer la compresión actual de tu archivo NEF. 
+                    
+                    **Para solucionar esto en tu cámara:**
+                    1. Ve al **Menú Disparo**.
+                    2. Busca **Grabación RAW**.
+                    3. Cambia la compresión a **'Comprimida sin pérdidas' (Lossless Compressed)**.
+                    4. *Evita* usar 'Alta eficiencia' (HE o HE*), ya que son formatos nuevos que las librerías gratuitas aún no procesan.
+                    
+                    **Si ya tienes las fotos hechas:**
+                    Puedes convertirlas a formato **DNG** usando el programa gratuito *Adobe DNG Converter* y luego subirlas aquí.
+                    """)
+                    with st.expander("Detalle técnico del error"):
+                        st.code(result)
+                else:
+                    st.error(f"Error técnico: {result}")
         
         gc.collect()
 else:
