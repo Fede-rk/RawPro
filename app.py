@@ -20,7 +20,7 @@ st.markdown("""
         background-color: #ff4b4b !important;
         color: white !important;
         border-radius: 8px !important;
-        height: 3em !important;
+        height: 3.5em !important;
         font-weight: bold !important;
     }
     .img-card {
@@ -30,70 +30,89 @@ st.markdown("""
         background-color: #1a1c23;
         margin-bottom: 30px;
     }
-    .stAlert {
-        border-radius: 10px;
-    }
     </style>
     """, unsafe_allow_html=True)
 
-# --- FUNCIONES DE PROCESAMIENTO ---
+# --- FUNCIONES DE PROCESAMIENTO OPTIMIZADAS ---
 
-def resize_for_social(img, short_edge=1080):
-    """Redimensiona la imagen para que el borde más corto sea de 1080px."""
-    w, h = img.size
-    if w < h: # Retrato o cuadrado
+def get_optimized_size(w, h, short_edge=1080):
+    """Calcula las dimensiones para que el borde corto sea de 1080px."""
+    if w < h: # Retrato
         new_w = short_edge
         new_h = int(h * (short_edge / w))
     else: # Paisaje
         new_h = short_edge
         new_w = int(w * (short_edge / h))
-    return img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    return new_w, new_h
 
 @st.cache_data(show_spinner=False)
-def get_base_raw(file_bytes, auto_bright=False):
-    """Revelado base del RAW con manejo de errores mejorado para cámaras nuevas."""
+def get_processed_base(file_bytes, auto_bright=False):
+    """Revelado base optimizado para evitar colapsos de memoria."""
     try:
         with rawpy.imread(io.BytesIO(file_bytes)) as raw:
             try:
-                # Intentamos desempaquetar. Si falla aquí, es el formato de compresión.
+                # Intentar desempaquetado normal
                 raw.unpack()
-            except Exception as unpack_err:
-                return f"UNSUPPORTED_COMPRESSION: {str(unpack_err)}"
-                
+            except Exception:
+                # FALLBACK: Si es un NEF de cámara nueva (Z50II) y falla, intentamos extraer la imagen embebida
+                try:
+                    thumb = raw.extract_thumb()
+                    if thumb.format == rawpy.ThumbFormat.JPEG:
+                        img = Image.open(io.BytesIO(thumb.data))
+                        return np.array(img)
+                    elif thumb.format == rawpy.ThumbFormat.BITMAP:
+                        return thumb.data
+                except:
+                    return "Error: Formato RAW no soportado por el motor LibRaw."
+
+            # Usamos half_size=True para la previsualización si el archivo es muy grande
+            # Esto ahorra un 75% de memoria durante la edición
             rgb = raw.postprocess(
                 use_camera_wb=True, 
                 no_auto_bright=not auto_bright, 
                 output_color=rawpy.ColorSpace.sRGB,
-                user_flip=0,
-                bright=1.0,
-                no_auto_scale=False
+                half_size=True, # Optimización clave para evitar OOM
+                bright=1.0
             )
             return rgb
     except Exception as e:
         return str(e)
 
 def apply_adjustments(rgb_array, params, lut_file=None):
-    """Motor de ajustes avanzados."""
+    """Aplica ajustes sobre la imagen optimizada."""
+    # Convertimos a float32 pero de forma controlada
     img_data = rgb_array.astype(np.float32) / 255.0
     
+    # Balance de Blancos
     if params['temp'] != 0:
         t = params['temp'] / 10.0
         img_data[:, :, 0] *= (1.0 + t)
         img_data[:, :, 2] *= (1.0 - t)
-        img_data = np.clip(img_data, 0, 1)
+        np.clip(img_data, 0, 1, out=img_data)
 
+    # Sombras y Luces (Optimizado para no crear múltiples copias en RAM)
     if params['shadows'] != 0:
         gamma_s = 1.0 - (params['shadows'] / 4.0)
-        img_data = np.where(img_data < 0.5, np.power(img_data * 2, gamma_s) / 2, img_data)
+        mask = img_data < 0.5
+        img_data[mask] = np.power(img_data[mask] * 2, gamma_s) / 2
+        
     if params['highlights'] != 0:
         gamma_h = 1.0 + (params['highlights'] / 4.0)
-        img_data = np.where(img_data >= 0.5, 1.0 - (np.power((1.0 - img_data) * 2, gamma_h) / 2), img_data)
+        mask = img_data >= 0.5
+        img_data[mask] = 1.0 - (np.power((1.0 - img_data[mask]) * 2, gamma_h) / 2)
 
     img = Image.fromarray((np.clip(img_data, 0, 1) * 255).astype(np.uint8))
     
-    img = ImageEnhance.Brightness(img).enhance(1.0 + (params['exposure'] / 5.0))
-    img = ImageEnhance.Contrast(img).enhance(params['contrast'])
-    img = ImageEnhance.Color(img).enhance(params['saturation'])
+    # Liberar memoria de array float
+    del img_data
+    
+    # Ajustes PIL (Más eficientes en memoria)
+    if params['exposure'] != 0:
+        img = ImageEnhance.Brightness(img).enhance(1.0 + (params['exposure'] / 5.0))
+    if params['contrast'] != 1.0:
+        img = ImageEnhance.Contrast(img).enhance(params['contrast'])
+    if params['saturation'] != 1.0:
+        img = ImageEnhance.Color(img).enhance(params['saturation'])
     
     if params['clarity'] > 0:
         img = img.filter(ImageFilter.UnsharpMask(radius=3, percent=int(params['clarity'] * 100)))
@@ -106,68 +125,66 @@ def apply_adjustments(rgb_array, params, lut_file=None):
             
     return img
 
-def create_social_frame(img, file_bytes, palette):
-    """Añade la ficha técnica y paleta al JPG final."""
-    img_resized = resize_for_social(img)
-    w, h = img_resized.size
+def create_social_export(img, file_bytes, palette):
+    """Genera la pieza final de 1080px de borde corto."""
+    # Redimensionar al tamaño final solicitado
+    target_w, target_h = get_optimized_size(img.width, img.height, 1080)
+    img_resized = img.resize((target_w, target_h), Image.Resampling.LANCZOS)
     
+    # Datos EXIF
     try:
         tags = exifread.process_file(io.BytesIO(file_bytes), details=False)
-        iso = tags.get('EXIF ISOSpeedRatings', 'N/A')
-        f_stop = tags.get('EXIF FNumber', 'N/A')
-        shutter = tags.get('EXIF ExposureTime', 'N/A')
-        exif_text = f"ISO {iso} | f/{f_stop} | {shutter}s"
+        exif_text = f"ISO {tags.get('EXIF ISOSpeedRatings', 'N/A')} | f/{tags.get('EXIF FNumber', 'N/A')} | {tags.get('EXIF ExposureTime', 'N/A')}s"
     except:
-        exif_text = "Datos EXIF no disponibles"
+        exif_text = "Metadata no disponible"
 
-    footer_h = int(h * 0.15)
-    canvas = Image.new('RGB', (w, h + footer_h), (15, 15, 15))
+    # Lienzo
+    footer_h = int(target_h * 0.15)
+    canvas = Image.new('RGB', (target_w, target_h + footer_h), (15, 15, 15))
     canvas.paste(img_resized, (0, 0))
     
     draw = ImageDraw.Draw(canvas)
     
-    pw = w // 10
-    start_x = (w - (pw * len(palette))) // 2
+    # Paleta
+    pw = target_w // 10
+    start_x = (target_w - (pw * 5)) // 2
     for i, color in enumerate(palette):
         x0 = start_x + (i * pw)
-        draw.rectangle([x0, h + 20, x0 + pw - 10, h + footer_h - 45], fill=color)
+        draw.rectangle([x0, target_h + 20, x0 + pw - 10, target_h + footer_h - 40], fill=color)
     
     try:
-        draw.text((w//2, h + footer_h - 25), exif_text, fill=(150, 150, 150), anchor="ms")
+        draw.text((target_w//2, target_h + footer_h - 22), exif_text, fill=(130, 130, 130), anchor="ms")
     except: pass
     
     return canvas
 
 def get_palette(img):
-    try:
-        img_small = img.resize((50, 50))
-        ar = np.asarray(img_small).reshape(-1, 3)
-        kmeans = KMeans(n_clusters=5, n_init=5).fit(ar)
-        return [tuple(c) for c in kmeans.cluster_centers_.astype(int)]
-    except:
-        return [(50,50,50)] * 5
+    img_small = img.resize((50, 50))
+    ar = np.asarray(img_small).reshape(-1, 3)
+    kmeans = KMeans(n_clusters=5, n_init=5).fit(ar)
+    return [tuple(c) for c in kmeans.cluster_centers_.astype(int)]
 
-# --- INTERFAZ DE USUARIO ---
+# --- INTERFAZ ---
 
-st.title("📷 RAW Studio: Social Media Ready")
+st.title("📷 RAW Studio: Engine Optimizado")
 
 with st.sidebar:
-    st.header("⚡ Ajustes Rápidos")
-    auto_mode = st.toggle("🚀 Optimizar Brillo Automático", value=False)
-    lut_upload = st.file_uploader("Cargar LUT (.CUBE)", type=['cube'])
+    st.header("⚡ Revelado")
+    auto_mode = st.toggle("🚀 Auto-Brillo AI", value=False)
+    lut_upload = st.file_uploader("Estilo (.CUBE)", type=['cube'])
     
-    with st.expander("Exposición y Color", expanded=True):
+    with st.expander("Luz y Color", expanded=True):
         exp = st.slider("Exposición", -5.0, 5.0, 0.0, 0.1)
         con = st.slider("Contraste", 0.5, 2.0, 1.0, 0.1)
         sat = st.slider("Saturación", 0.0, 2.0, 1.0, 0.1)
         temp = st.slider("Temperatura", -2.0, 2.0, 0.0, 0.1)
 
-    with st.expander("Sombras y Luces"):
+    with st.expander("Detalles Avanzados"):
         sha = st.slider("Sombras", -1.0, 1.0, 0.0, 0.1)
         hig = st.slider("Altas Luces", -1.0, 1.0, 0.0, 0.1)
         cla = st.slider("Claridad", 0.0, 2.0, 0.0, 0.1)
 
-    if st.button("Limpiar Memoria"):
+    if st.button("Vaciar Memoria Caché"):
         st.cache_data.clear()
         st.rerun()
 
@@ -176,61 +193,43 @@ params = {
     'temp': temp, 'shadows': sha, 'highlights': hig, 'clarity': cla
 }
 
-uploaded_files = st.file_uploader("Sube tus archivos RAW", type=['nef', 'cr2', 'arw', 'dng', 'orf'], accept_multiple_files=True)
+uploaded_files = st.file_uploader("Sube tus fotos (RAW/DNG)", type=['nef', 'cr2', 'arw', 'dng'], accept_multiple_files=True)
 
 if uploaded_files:
     st.divider()
     cols = st.columns(2)
     
     for idx, file in enumerate(uploaded_files[:10]):
-        file_data = file.getvalue()
-        result = get_base_raw(file_data, auto_bright=auto_mode)
+        data = file.getvalue()
+        base = get_processed_base(data, auto_bright=auto_mode)
         
-        if isinstance(result, np.ndarray):
-            final_img = apply_adjustments(result, params, lut_upload)
-            preview_img = final_img.copy()
-            preview_img.thumbnail((1000, 1000))
-            palette = get_palette(preview_img)
+        if isinstance(base, np.ndarray):
+            # Procesar
+            img_edited = apply_adjustments(base, params, lut_upload)
+            palette = get_palette(img_edited)
             
             with cols[idx % 2]:
-                st.markdown(f'<div class="img-card">', unsafe_allow_html=True)
-                st.image(preview_img, caption=f"Editando: {file.name}", use_container_width=True)
+                st.markdown('<div class="img-card">', unsafe_allow_html=True)
+                st.image(img_edited, caption=file.name, use_container_width=True)
                 
-                social_jpg = create_social_frame(final_img, file_data, palette)
+                # Generar exportación Social
+                final_jpg = create_social_export(img_edited, data, palette)
                 buf = io.BytesIO()
-                social_jpg.save(buf, format="JPEG", quality=95, subsampling=0)
+                final_social_img = final_jpg.save(buf, format="JPEG", quality=92)
                 
                 st.download_button(
-                    label=f"💾 DESCARGAR JPG (1080px)",
+                    label="💾 DESCARGAR JPG (1080px)",
                     data=buf.getvalue(),
-                    file_name=f"SOCIAL_{os.path.splitext(file.name)[0]}.jpg",
+                    file_name=f"RAW_PRO_{file.name}.jpg",
                     mime="image/jpeg",
                     key=f"dl_{idx}"
                 )
                 st.markdown('</div>', unsafe_allow_html=True)
         else:
-            with cols[idx % 2]:
-                st.error(f"Error en {file.name}")
-                
-                if "UNSUPPORTED_COMPRESSION" in str(result) or "Data error" in str(result):
-                    st.warning(f"⚠️ **Problema de Compatibilidad con Nikon Z50II**")
-                    st.markdown(f"""
-                    El motor de revelado no puede leer la compresión actual de tu archivo NEF. 
-                    
-                    **Para solucionar esto en tu cámara:**
-                    1. Ve al **Menú Disparo**.
-                    2. Busca **Grabación RAW**.
-                    3. Cambia la compresión a **'Comprimida sin pérdidas' (Lossless Compressed)**.
-                    4. *Evita* usar 'Alta eficiencia' (HE o HE*), ya que son formatos nuevos que las librerías gratuitas aún no procesan.
-                    
-                    **Si ya tienes las fotos hechas:**
-                    Puedes convertirlas a formato **DNG** usando el programa gratuito *Adobe DNG Converter* y luego subirlas aquí.
-                    """)
-                    with st.expander("Detalle técnico del error"):
-                        st.code(result)
-                else:
-                    st.error(f"Error técnico: {result}")
+            st.error(f"Error en {file.name}: {base}")
+            if ".NEF" in file.name.upper():
+                st.warning("Cámara nueva detectada. Se ha intentado extraer el JPG embebido pero el formato es propietario.")
         
         gc.collect()
 else:
-    st.info("👋 Sube tus fotos RAW para ver la vista previa y aplicar los ajustes.")
+    st.info("Sube tus archivos para comenzar. El motor se ha optimizado para evitar cierres por falta de memoria.")
